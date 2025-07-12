@@ -7,13 +7,13 @@ use core::fmt;
 use kspin::SpinNoIrq;
 use weak_map::WeakMap;
 
-use crate::{Pid, Process, Session};
+use crate::{Pid, ProcessExt, Session};
 
 /// A [`ProcessGroup`] is a collection of [`Process`]es.
 pub struct ProcessGroup {
     pgid: Pid,
     pub(crate) session: Arc<Session>,
-    pub(crate) processes: SpinNoIrq<WeakMap<Pid, Weak<Process>>>,
+    pub(crate) processes: SpinNoIrq<WeakMap<Pid, Weak<dyn ProcessExt>>>,
 }
 
 impl ProcessGroup {
@@ -41,7 +41,7 @@ impl ProcessGroup {
     }
 
     /// The [`Process`]es that belong to this [`ProcessGroup`].
-    pub fn processes(&self) -> Vec<Arc<Process>> {
+    pub fn processes(&self) -> Vec<Arc<dyn ProcessExt>> {
         self.processes.lock().values().collect()
     }
 }

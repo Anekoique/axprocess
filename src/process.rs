@@ -3,6 +3,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
+    any::Any,
     fmt,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -29,6 +30,31 @@ impl Default for ThreadGroup {
     }
 }
 
+pub trait ProcessExt: Send + Sync {
+    fn base(&self) -> &Process;
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
+    fn set_group(self: Arc<Self>, group: &Arc<ProcessGroup>);
+    fn new_thread(self: Arc<Self>, tid: Pid) -> Arc<Thread>;
+    fn pid(&self) -> Pid {
+        self.base().pid
+    }
+    fn group(&self) -> Arc<ProcessGroup> {
+        self.base().group.lock().clone()
+    }
+    fn parent(&self) -> Option<Arc<dyn ProcessExt>> {
+        self.base().parent.lock().as_ref().and_then(|p| p.upgrade())
+    }
+    fn children(&self) -> Vec<Arc<dyn ProcessExt>> {
+        self.base().children.lock().values().cloned().collect()
+    }
+    fn exit(&self) {
+        self.base().exit();
+    }
+    fn free(&self) {
+        self.base().free();
+    }
+}
+
 /// A process.
 pub struct Process {
     pid: Pid,
@@ -36,10 +62,42 @@ pub struct Process {
     pub(crate) tg: SpinNoIrq<ThreadGroup>,
 
     // TODO: child subreaper
-    children: SpinNoIrq<StrongMap<Pid, Arc<Process>>>,
-    parent: SpinNoIrq<Weak<Process>>,
+    children: SpinNoIrq<StrongMap<Pid, Arc<dyn ProcessExt>>>,
+    parent: SpinNoIrq<Option<Weak<dyn ProcessExt>>>,
 
     group: SpinNoIrq<Arc<ProcessGroup>>,
+}
+
+impl ProcessExt for Process {
+    fn base(&self) -> &Process {
+        self
+    }
+
+    fn into_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+
+    fn set_group(self: Arc<Self>, group: &Arc<ProcessGroup>) {
+        let mut self_group = self.group.lock();
+
+        self_group.processes.lock().remove(&self.pid);
+
+        group
+            .processes
+            .lock()
+            .insert(self.pid, &(self.clone() as Arc<dyn ProcessExt>));
+
+        *self_group = group.clone();
+    }
+
+    fn new_thread(self: Arc<Self>, tid: Pid) -> Arc<Thread> {
+        let thread = Arc::new(Thread {
+            tid,
+            process: self.clone(),
+        });
+        self.tg.lock().threads.insert(tid, &thread);
+        thread
+    }
 }
 
 impl Process {
@@ -61,12 +119,12 @@ impl Process {
 /// Parent & children
 impl Process {
     /// The parent [`Process`].
-    pub fn parent(&self) -> Option<Arc<Process>> {
-        self.parent.lock().upgrade()
+    pub fn parent(&self) -> Option<Arc<dyn ProcessExt>> {
+        self.parent.lock().as_ref().and_then(|p| p.upgrade())
     }
 
     /// The child [`Process`]es.
-    pub fn children(&self) -> Vec<Arc<Process>> {
+    pub fn children(&self) -> Vec<Arc<dyn ProcessExt>> {
         self.children.lock().values().cloned().collect()
     }
 }
@@ -76,16 +134,6 @@ impl Process {
     /// The [`ProcessGroup`] that the [`Process`] belongs to.
     pub fn group(&self) -> Arc<ProcessGroup> {
         self.group.lock().clone()
-    }
-
-    fn set_group(self: &Arc<Self>, group: &Arc<ProcessGroup>) {
-        let mut self_group = self.group.lock();
-
-        self_group.processes.lock().remove(&self.pid);
-
-        group.processes.lock().insert(self.pid, self);
-
-        *self_group = group.clone();
     }
 
     /// Creates a new [`Session`] and new [`ProcessGroup`] and moves the
@@ -101,7 +149,7 @@ impl Process {
     /// be a [`ProcessGroup`] leader.
     ///
     /// Checking [`Session`] conflicts is unnecessary.
-    pub fn create_session(self: &Arc<Self>) -> Option<(Arc<Session>, Arc<ProcessGroup>)> {
+    pub fn create_session(self: Arc<Self>) -> Option<(Arc<Session>, Arc<ProcessGroup>)> {
         if self.group.lock().session.sid() == self.pid {
             return None;
         }
@@ -122,7 +170,7 @@ impl Process {
     ///
     /// The caller has to ensure that the new [`ProcessGroup`] does not conflict
     /// with any existing [`ProcessGroup`].
-    pub fn create_group(self: &Arc<Self>) -> Option<Arc<ProcessGroup>> {
+    pub fn create_group(self: Arc<Self>) -> Option<Arc<ProcessGroup>> {
         if self.group.lock().pgid() == self.pid {
             return None;
         }
@@ -140,7 +188,7 @@ impl Process {
     ///
     /// If the [`Process`] is already in the specified [`ProcessGroup`], this
     /// method does nothing and returns `true`.
-    pub fn move_to_group(self: &Arc<Self>, group: &Arc<ProcessGroup>) -> bool {
+    pub fn move_to_group(self: Arc<Self>, group: &Arc<ProcessGroup>) -> bool {
         if Arc::ptr_eq(&self.group.lock(), group) {
             return true;
         }
@@ -156,16 +204,6 @@ impl Process {
 
 /// Threads
 impl Process {
-    /// Creates a new [`Thread`] in this [`Process`].
-    pub fn new_thread(self: &Arc<Self>, tid: Pid) -> Arc<Thread> {
-        let thread = Arc::new(Thread {
-            tid,
-            process: self.clone(),
-        });
-        self.tg.lock().threads.insert(tid, &thread);
-        thread
-    }
-
     /// The [`Thread`]s in this [`Process`].
     pub fn threads(&self) -> Vec<Arc<Thread>> {
         self.tg.lock().threads.values().collect()
@@ -215,7 +253,7 @@ impl Process {
         let reaper = Arc::downgrade(reaper);
 
         for (pid, child) in core::mem::take(&mut *children) {
-            *child.parent.lock() = reaper.clone();
+            *child.base().parent.lock() = Some(reaper.clone());
             reaper_children.insert(pid, child);
         }
     }
@@ -227,7 +265,7 @@ impl Process {
         assert!(self.is_zombie(), "only zombie process can be freed");
 
         if let Some(parent) = self.parent() {
-            parent.children.lock().remove(&self.pid);
+            parent.base().children.lock().remove(&self.pid);
         }
     }
 }
@@ -255,7 +293,7 @@ impl fmt::Debug for Process {
 
 /// Builder
 impl Process {
-    fn new(pid: Pid, parent: Option<Arc<Process>>) -> Arc<Process> {
+    fn new(pid: Pid, parent: Option<Arc<dyn ProcessExt>>) -> Arc<Process> {
         let group = parent.as_ref().map_or_else(
             || {
                 let session = Session::new(pid);
@@ -269,14 +307,25 @@ impl Process {
             is_zombie: AtomicBool::new(false),
             tg: SpinNoIrq::new(ThreadGroup::default()),
             children: SpinNoIrq::new(StrongMap::new()),
-            parent: SpinNoIrq::new(parent.as_ref().map(Arc::downgrade).unwrap_or_default()),
+            parent: SpinNoIrq::new(
+                parent
+                    .as_ref()
+                    .map(|p| Arc::downgrade(p) as Weak<dyn ProcessExt>),
+            ),
             group: SpinNoIrq::new(group.clone()),
         });
 
-        group.processes.lock().insert(pid, &process);
+        group
+            .processes
+            .lock()
+            .insert(pid, &(process.clone() as Arc<dyn ProcessExt>));
 
         if let Some(parent) = parent {
-            parent.children.lock().insert(pid, process.clone());
+            parent
+                .base()
+                .children
+                .lock()
+                .insert(pid, process.clone() as Arc<dyn ProcessExt>);
         } else {
             INIT_PROC.init_once(process.clone());
         }
@@ -294,7 +343,7 @@ impl Process {
 
     /// Creates a child [`Process`].
     pub fn fork(self: &Arc<Process>, pid: Pid) -> Arc<Process> {
-        Self::new(pid, Some(self.clone()))
+        Self::new(pid, Some(self.clone() as Arc<dyn ProcessExt>))
     }
 }
 
